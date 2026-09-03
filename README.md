@@ -39,8 +39,9 @@ Its success and error schemas match the endpoint's actual JSON responses.
 ```
 
 The tests fake every upstream response and make no network calls. They cover a
-successful conversion, weekend rate attribution, caching, invalid inputs,
-out-of-range dates, upstream failures, malformed JSON, and timeouts.
+successful conversion, weekend rate attribution, cache expiry, concurrent
+request sharing and recovery, invalid inputs, out-of-range dates, upstream
+failures, malformed JSON, and timeouts.
 
 ## Behaviour
 
@@ -62,9 +63,12 @@ Currency codes are trimmed and normalised to uppercase. Calculations use
 `Decimal`; the full upstream rate is used and only the final converted amount
 is rounded to two decimals with `ROUND_HALF_UP`.
 
-Rates are cached in process by `(from, to, asked_date)`. Therefore an immediate
-repeat does not call the upstream again, while requests for different dates
-cannot share a rate.
+Rates are cached in process by `(from, to, asked_date)`, so requests for
+different dates cannot share a rate. Historical entries do not expire because
+published ECB rates are immutable. An entry for the current UTC date expires
+after five minutes, allowing a value fetched before the daily publication to be
+refreshed. Concurrent cache misses for the same key share one upstream request;
+an upstream failure is not cached and a later request can retry.
 
 ## Error codes
 

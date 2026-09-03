@@ -13,16 +13,18 @@ to preserve cents as a JSON number is rejected instead of being silently changed
 
 Expected upstream and input failures return a stable non-2xx error envelope.
 The cache key is `(source, target, asked_date)`, which satisfies repeat requests
-without allowing one date's rate to be used for another.
+without allowing one date's rate to be used for another. Historical records do
+not expire; today's record has a five-minute lifetime so a pre-publication value
+can refresh. Concurrent misses for one key share one upstream task, and a failed
+task is removed so that the next request can retry.
 
 ## With another day
 
-I would give today's cache entries a bounded lifetime because today's
-Frankfurter value can change when the ECB publishes, add a maximum cache size,
-and collapse simultaneous identical misses into one upstream request. I would
-also reuse one lifespan-managed `AsyncClient`, add structured request logging,
-and query/cache `/v1/currencies` so an unknown currency can be distinguished
-from a historically unavailable valid pair.
+I would add a maximum cache size and, for multi-worker deployment, use a shared
+cache rather than one cache per process. I would also reuse one lifespan-managed
+`AsyncClient`, add structured request logging, and query/cache `/v1/currencies`
+so an unknown currency can be distinguished from a historically unavailable
+valid pair.
 
 ## AI tools
 

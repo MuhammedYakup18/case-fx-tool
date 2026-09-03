@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import httpx
@@ -15,6 +16,7 @@ client = TestClient(fx_app.app)
 @pytest.fixture(autouse=True)
 def clear_cache() -> None:
     fx_app._rate_cache.clear()
+    fx_app._inflight_requests.clear()
 
 
 def upstream_response(status_code: int = 200, **kwargs: object) -> httpx.Response:
@@ -110,6 +112,121 @@ def test_cache_does_not_mix_different_dates(monkeypatch: pytest.MonkeyPatch) -> 
     assert first.json()["rate"] == 46.5
     assert second.json()["rate"] == 47
     assert request_rate.await_count == 2
+
+
+def test_today_cache_is_reused_before_ttl_and_refreshed_after_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(fx_app, "_today_utc", lambda: fx_app.date(2026, 8, 28))
+    monkeypatch.setattr(fx_app, "monotonic", lambda: now[0])
+    request_rate = AsyncMock(
+        side_effect=[
+            upstream_response(
+                json={"base": "EUR", "date": "2026-08-27", "rates": {"TRY": 46.5}}
+            ),
+            upstream_response(
+                json={"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47.0}}
+            ),
+        ]
+    )
+    monkeypatch.setattr(fx_app, "_request_rate", request_rate)
+    params = {"amount": "1", "from": "EUR", "to": "TRY", "date": "2026-08-28"}
+
+    first = client.get("/tools/convert", params=params)
+    second = client.get("/tools/convert", params=params)
+
+    assert first.json()["rate_date"] == "2026-08-27"
+    assert second.json()["rate_date"] == "2026-08-27"
+    assert request_rate.await_count == 1
+
+    now[0] += fx_app.TODAY_CACHE_TTL_SECONDS
+    refreshed = client.get("/tools/convert", params=params)
+
+    assert refreshed.json()["rate_date"] == "2026-08-28"
+    assert request_rate.await_count == 2
+
+
+def test_concurrent_identical_misses_share_one_upstream_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        request_rate = AsyncMock()
+
+        async def delayed_response(*_args: object) -> httpx.Response:
+            started.set()
+            await release.wait()
+            return upstream_response(
+                json={"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47.0}}
+            )
+
+        request_rate.side_effect = delayed_response
+        monkeypatch.setattr(fx_app, "_request_rate", request_rate)
+        asked_date = fx_app.date(2026, 8, 28)
+        tasks = [
+            asyncio.create_task(fx_app._get_rate("EUR", "TRY", asked_date))
+            for _ in range(5)
+        ]
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert request_rate.await_count == 1
+
+        release.set()
+        records = await asyncio.gather(*tasks)
+
+        assert all(record.rate == fx_app.Decimal("47.0") for record in records)
+        assert request_rate.await_count == 1
+
+    asyncio.run(exercise())
+
+
+def test_failed_shared_request_is_cleared_and_next_request_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def fail_then_succeed(*_args: object) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                started.set()
+                await release.wait()
+                raise httpx.ReadTimeout("too slow")
+            return upstream_response(
+                json={"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47.0}}
+            )
+
+        monkeypatch.setattr(fx_app, "_request_rate", fail_then_succeed)
+        asked_date = fx_app.date(2026, 8, 28)
+        tasks = [
+            asyncio.create_task(fx_app._get_rate("EUR", "TRY", asked_date))
+            for _ in range(5)
+        ]
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        failures = await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert call_count == 1
+        assert all(
+            isinstance(error, fx_app.ConversionError)
+            and error.code == "upstream_timeout"
+            for error in failures
+        )
+
+        await asyncio.sleep(0)
+        retry = await fx_app._get_rate("EUR", "TRY", asked_date)
+
+        assert retry.rate == fx_app.Decimal("47.0")
+        assert call_count == 2
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("amount", ["0", "-1", "1.1234567890", "not-a-number"])

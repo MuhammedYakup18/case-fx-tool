@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -19,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 DEFAULT_UPSTREAM_BASE = "https://api.frankfurter.dev"
 FIRST_ECB_RATE_DATE = date(1999, 1, 4)
 UPSTREAM_TIMEOUT_SECONDS = 5.0
+TODAY_CACHE_TTL_SECONDS = 300.0
 MAX_AMOUNT = Decimal("1000000000")
 # Non-integral Decimal values are emitted as JSON numbers (Python floats).
 # Staying below this magnitude keeps cent-level values distinguishable in an
@@ -43,6 +46,12 @@ class ConversionError(Exception):
 class RateRecord:
     rate: Decimal
     rate_date: date
+
+
+@dataclass(frozen=True)
+class CacheEntry:
+    record: RateRecord
+    expires_at: float | None
 
 
 class ConversionResponse(BaseModel):
@@ -86,9 +95,14 @@ class ErrorResponse(BaseModel):
     message: str
 
 
-# Historical rates do not change. Including every input that selects a rate in
-# the key prevents a cached rate from leaking into a request for another date.
-_rate_cache: dict[tuple[str, str, date], RateRecord] = {}
+CacheKey = tuple[str, str, date]
+
+# Historical rates do not change. Today's entry expires so a value fetched
+# before the daily ECB publication cannot stay stale for the process lifetime.
+_rate_cache: dict[CacheKey, CacheEntry] = {}
+# Concurrent misses for one key share the same task. A failed task is removed,
+# allowing the next request to retry instead of caching or retaining the error.
+_inflight_requests: dict[CacheKey, asyncio.Task[RateRecord]] = {}
 
 
 @app.exception_handler(ConversionError)
@@ -161,8 +175,12 @@ def _parse_amount(raw_amount: str) -> Decimal:
     return amount
 
 
+def _today_utc() -> date:
+    return datetime.now(timezone.utc).date()
+
+
 def _validate_date(asked_date: date) -> None:
-    today_utc = datetime.now(timezone.utc).date()
+    today_utc = _today_utc()
     if asked_date > today_utc:
         raise ConversionError(
             422, "future_date", "A rate cannot be requested for a future date."
@@ -280,11 +298,9 @@ def _calculate_result(amount: Decimal, rate: Decimal) -> Decimal:
     return result
 
 
-async def _get_rate(source: str, target: str, asked_date: date) -> RateRecord:
-    cache_key = (source, target, asked_date)
-    if cache_key in _rate_cache:
-        return _rate_cache[cache_key]
-
+async def _fetch_and_cache_rate(
+    cache_key: CacheKey, source: str, target: str, asked_date: date
+) -> RateRecord:
     try:
         response = await _request_rate(source, target, asked_date)
     except httpx.TimeoutException:
@@ -301,8 +317,41 @@ async def _get_rate(source: str, target: str, asked_date: date) -> RateRecord:
         ) from None
 
     record = _read_rate_payload(response, source, target, asked_date)
-    _rate_cache[cache_key] = record
+    expires_at = None
+    if asked_date == _today_utc():
+        expires_at = monotonic() + TODAY_CACHE_TTL_SECONDS
+    _rate_cache[cache_key] = CacheEntry(record=record, expires_at=expires_at)
     return record
+
+
+def _remove_inflight_request(
+    cache_key: CacheKey, task: asyncio.Task[RateRecord]
+) -> None:
+    if _inflight_requests.get(cache_key) is task:
+        _inflight_requests.pop(cache_key, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _get_rate(source: str, target: str, asked_date: date) -> RateRecord:
+    cache_key = (source, target, asked_date)
+    entry = _rate_cache.get(cache_key)
+    if entry is not None:
+        if entry.expires_at is None or monotonic() < entry.expires_at:
+            return entry.record
+        _rate_cache.pop(cache_key, None)
+
+    task = _inflight_requests.get(cache_key)
+    if task is None:
+        task = asyncio.create_task(
+            _fetch_and_cache_rate(cache_key, source, target, asked_date)
+        )
+        _inflight_requests[cache_key] = task
+        task.add_done_callback(
+            lambda done, key=cache_key: _remove_inflight_request(key, done)
+        )
+
+    return await asyncio.shield(task)
 
 
 def _json_number(value: Decimal) -> int | float:
