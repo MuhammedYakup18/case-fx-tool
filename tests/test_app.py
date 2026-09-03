@@ -493,3 +493,131 @@ def test_openapi_documents_the_real_success_and_error_shapes() -> None:
     for status_code in ("422", "502", "504"):
         error_schema = responses[status_code]["content"]["application/json"]["schema"]
         assert error_schema["$ref"].endswith("/ErrorResponse")
+
+
+@pytest.mark.parametrize(
+    ("raw_rate", "expected_result"),
+    [
+        ("1.00000000000499999", 1000000000),
+        ("1.000000000004999999999999999999999999", 1000000000),
+        ("1.000000000005", 1000000000.01),
+    ],
+)
+def test_raw_json_rate_preserves_cent_rounding(
+    monkeypatch: pytest.MonkeyPatch, raw_rate: str, expected_result: int | float
+) -> None:
+    # A Python float fixture would discard the precision before the test starts.
+    body = (
+        '{"base":"EUR","date":"2026-08-28","rates":{"TRY":'
+        + raw_rate
+        + "}}"
+    ).encode()
+    monkeypatch.setattr(
+        fx_app,
+        "_request_rate",
+        AsyncMock(return_value=upstream_response(content=body)),
+    )
+
+    response = client.get(
+        "/tools/convert",
+        params={
+            "amount": "1000000000",
+            "from": "EUR",
+            "to": "TRY",
+            "date": "2026-08-28",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == expected_result
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"extra":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}",
+        b'{"base":"EUR","date":"2026-08-28",'
+        b'"rates":{"TRY":1e9999999999999999999}}',
+    ],
+    ids=["excessive-nesting", "unrepresentable-decimal-exponent"],
+)
+def test_unparseable_upstream_json_uses_error_envelope(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    monkeypatch.setattr(
+        fx_app,
+        "_request_rate",
+        AsyncMock(return_value=upstream_response(content=body)),
+    )
+
+    with TestClient(fx_app.app, raise_server_exceptions=False) as api:
+        response = api.get(
+            "/tools/convert",
+            params={"amount": "250", "from": "EUR", "to": "TRY", "date": "2026-08-28"},
+        )
+
+    assert response.status_code == 502
+    assert response.headers["content-type"] == "application/json"
+    assert response.json()["error"] == "invalid_upstream_response"
+    assert isinstance(response.json()["message"], str)
+
+
+def test_total_deadline_stops_dripping_response_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(fx_app, "UPSTREAM_TIMEOUT_SECONDS", 0.05)
+
+    async def exercise() -> None:
+        stream_closed = asyncio.Event()
+        calls = 0
+
+        class DrippingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                # Each gap is below the read timeout, but the full body is slow.
+                body = b'{"base":"EUR","date":"2026-08-28","rates":{"TRY":47}}'
+                for byte in body:
+                    yield bytes([byte])
+                    await asyncio.sleep(0.01)
+
+            async def aclose(self) -> None:
+                stream_closed.set()
+
+        def upstream(_request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(200, stream=DrippingStream())
+            return httpx.Response(
+                200, json={"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47}}
+            )
+
+        transport = httpx.MockTransport(upstream)
+        monkeypatch.setattr(
+            fx_app.httpx,
+            "AsyncClient",
+            lambda **kwargs: original_client(transport=transport, **kwargs),
+        )
+        params = {"amount": "250", "from": "EUR", "to": "TRY", "date": "2026-08-28"}
+        async with original_client(
+            transport=httpx.ASGITransport(app=fx_app.app), base_url="http://testserver"
+        ) as api:
+            responses = await asyncio.wait_for(
+                asyncio.gather(
+                    api.get("/tools/convert", params=params),
+                    api.get("/tools/convert", params=params),
+                ),
+                timeout=2,
+            )
+            assert calls == 1
+            for response in responses:
+                assert response.status_code == 504
+                assert response.json()["error"] == "upstream_timeout"
+            assert stream_closed.is_set()
+
+            retry = await api.get("/tools/convert", params=params)
+            assert retry.status_code == 200
+            assert retry.json()["result"] == 11750
+            assert calls == 2
+
+    asyncio.run(exercise())

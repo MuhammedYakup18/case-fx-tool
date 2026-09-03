@@ -7,7 +7,13 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
+from decimal import (
+    Decimal,
+    DecimalException,
+    InvalidOperation,
+    ROUND_HALF_UP,
+    localcontext,
+)
 from time import monotonic
 from typing import Any
 
@@ -227,8 +233,8 @@ def _read_rate_payload(
         )
 
     try:
-        payload: Any = response.json()
-    except ValueError:
+        payload: Any = response.json(parse_float=Decimal)
+    except (ValueError, RecursionError, InvalidOperation):
         raise ConversionError(
             502,
             "invalid_upstream_response",
@@ -279,9 +285,15 @@ def _read_rate_payload(
 
 def _calculate_result(amount: Decimal, rate: Decimal) -> Decimal:
     try:
-        result = (amount * rate).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
+        with localcontext() as context:
+            # Preserve the exact product before rounding to cents, even when
+            # the upstream rate has more than the default 28 significant digits.
+            context.prec = max(
+                28, len(amount.as_tuple().digits) + len(rate.as_tuple().digits)
+            )
+            result = (amount * rate).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
     except DecimalException:
         raise ConversionError(
             502,
@@ -302,8 +314,11 @@ async def _fetch_and_cache_rate(
     cache_key: CacheKey, source: str, target: str, asked_date: date
 ) -> RateRecord:
     try:
-        response = await _request_rate(source, target, asked_date)
-    except httpx.TimeoutException:
+        # Bound the whole shared fetch, including a response that keeps sending
+        # small chunks before HTTPX's per-read timeout can expire.
+        async with asyncio.timeout(UPSTREAM_TIMEOUT_SECONDS):
+            response = await _request_rate(source, target, asked_date)
+    except (TimeoutError, httpx.TimeoutException):
         raise ConversionError(
             504,
             "upstream_timeout",

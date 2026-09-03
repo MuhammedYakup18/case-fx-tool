@@ -6,7 +6,7 @@ or malformed upstream response never becomes a made-up conversion.
 
 ## Setup and run
 
-Python 3.11+ is recommended.
+Python 3.11+ is required.
 
 ```bash
 python -m venv .venv
@@ -41,7 +41,8 @@ Its success and error schemas match the endpoint's actual JSON responses.
 The tests fake every upstream response and make no network calls. They cover a
 successful conversion, weekend rate attribution, cache expiry, concurrent
 request sharing and recovery, invalid inputs, out-of-range dates, upstream
-failures, malformed JSON, and timeouts.
+failures, deeply nested/malformed JSON, exact cent rounding with high-precision
+rates, and total fetch timeouts even when the upstream keeps sending data.
 
 ## Behaviour
 
@@ -59,9 +60,14 @@ failures, malformed JSON, and timeouts.
 | Upstream date before the ECB series, after the requested date, or rate too small/large to preserve as a JSON number | Return `502 invalid_upstream_response`. |
 | Slow, unreachable, 5xx, or malformed upstream | Return a `502`/`504` error and no conversion. |
 
-Currency codes are trimmed and normalised to uppercase. Calculations use
-`Decimal`; the full upstream rate is used and only the final converted amount
-is rounded to two decimals with `ROUND_HALF_UP`.
+Currency codes are trimmed and normalised to uppercase. Fractional JSON numbers
+are parsed directly as `Decimal`, and multiplication preserves their precision.
+Only the final converted amount is rounded to two decimals with `ROUND_HALF_UP`.
+
+Each upstream fetch has a five-second total deadline as well as HTTPX's network
+timeouts. The deadline also stops responses that keep sending small chunks.
+On timeout the shared fetch is cancelled, callers receive `504 upstream_timeout`,
+and a later request can retry.
 
 Rates are cached in process by `(from, to, asked_date)`, so requests for
 different dates cannot share a rate. Historical entries do not expire because
@@ -92,4 +98,4 @@ Every failure has a non-2xx status and the same body shape:
 | 502 | `upstream_unavailable` | The upstream could not be reached. |
 | 502 | `upstream_error` | The upstream returned an error status. |
 | 502 | `invalid_upstream_response` | JSON, base currency, date, or rate data was inconsistent or unsafe to represent. |
-| 504 | `upstream_timeout` | The upstream exceeded the five-second timeout. |
+| 504 | `upstream_timeout` | The upstream exceeded a network timeout or the five-second total fetch deadline. |
