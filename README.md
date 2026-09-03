@@ -29,6 +29,9 @@ Example:
 curl 'http://localhost:8080/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28'
 ```
 
+Interactive OpenAPI documentation is available at `http://localhost:8080/docs`.
+Its success and error schemas match the endpoint's actual JSON responses.
+
 ## Tests
 
 ```bash
@@ -52,6 +55,7 @@ out-of-range dates, upstream failures, malformed JSON, and timeouts.
 | Missing, non-numeric, zero, or negative amount | Return a `422` error. |
 | More than two amount decimal places | Return `422 invalid_amount_precision`; the tool treats the input as a monetary amount. |
 | Amount above 1,000,000,000, or a converted result too large to represent safely as a JSON number | Return `422 amount_too_large` instead of rounding or crashing. |
+| Upstream date before the ECB series, after the requested date, or rate too small/large to preserve as a JSON number | Return `502 invalid_upstream_response`. |
 | Slow, unreachable, 5xx, or malformed upstream | Return a `502`/`504` error and no conversion. |
 
 Currency codes are trimmed and normalised to uppercase. Calculations use
@@ -83,5 +87,5 @@ Every failure has a non-2xx status and the same body shape:
 | 422 | `rate_unavailable` | Frankfurter has no rate for the pair and date. |
 | 502 | `upstream_unavailable` | The upstream could not be reached. |
 | 502 | `upstream_error` | The upstream returned an error status. |
-| 502 | `invalid_upstream_response` | JSON, date, or rate data was unusable. |
+| 502 | `invalid_upstream_response` | JSON, base currency, date, or rate data was inconsistent or unsafe to represent. |
 | 504 | `upstream_timeout` | The upstream exceeded the five-second timeout. |

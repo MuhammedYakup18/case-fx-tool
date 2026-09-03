@@ -26,17 +26,18 @@ from a historically unavailable valid pair.
 
 ## AI tools
 
-I used OpenAI Codex to inspect the brief, draft the implementation and tests,
-and challenge the error-handling and date-provenance decisions. I verified the
-critical weekend and series-boundary assumptions against live Frankfurter v1
-responses, reviewed every generated path, and kept the solution intentionally
-small.
+I used ChatGPT to reason about the brief, customer impact, and adversarial edge
+cases, and OpenAI Codex to inspect the repository, edit the implementation, and
+run the tests. I verified the critical weekend and series-boundary assumptions
+against live Frankfurter v1 responses, reviewed the generated paths, and kept
+the solution intentionally small.
 
 ## One thing the AI got wrong
 
-The first AI-generated draft used `Decimal` for the calculation but converted
-non-integer values to `float` for JSON without limiting their magnitude. An
-adversarial review found that `100000000000000.01` was returned as
-`100000000000000.02`, while `1e30` caused an unhandled 500. I reproduced both,
-added an explicit amount and safe-result limit, returned a stable 422 error, and
-kept both inputs as regression tests.
+The first AI-generated draft did not validate every numeric and date boundary.
+Adversarial review found that `100000000000000.01` changed by one cent, `1e30`
+caused an unhandled 500, `1e-400` became a zero rate, and a pre-1999 upstream
+date was accepted. I reproduced the cases, added explicit input/output and
+upstream bounds, returned stable errors, and kept every case as a regression
+test. This was a useful reminder that passing generated tests is not enough;
+external data and serialization boundaries also need to be challenged.

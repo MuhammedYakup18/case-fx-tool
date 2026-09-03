@@ -262,6 +262,58 @@ def test_non_json_upstream_response_fails_closed(
     assert response.json()["error"] == "invalid_upstream_response"
 
 
+def test_rate_that_underflows_when_encoded_as_json_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fx_app,
+        "_request_rate",
+        AsyncMock(
+            return_value=upstream_response(
+                json={
+                    "base": "EUR",
+                    "date": "2026-08-28",
+                    "rates": {"TRY": "1e-400"},
+                }
+            )
+        ),
+    )
+
+    response = client.get(
+        "/tools/convert",
+        params={"amount": "1", "from": "EUR", "to": "TRY", "date": "2026-08-28"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "invalid_upstream_response"
+
+
+def test_upstream_date_before_the_ecb_series_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fx_app,
+        "_request_rate",
+        AsyncMock(
+            return_value=upstream_response(
+                json={
+                    "base": "EUR",
+                    "date": "1998-12-31",
+                    "rates": {"TRY": 47.1234},
+                }
+            )
+        ),
+    )
+
+    response = client.get(
+        "/tools/convert",
+        params={"amount": "1", "from": "EUR", "to": "TRY", "date": "2026-08-28"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "invalid_upstream_response"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -312,3 +364,15 @@ def test_upstream_base_comes_from_environment(
         fx_app._upstream_url(fx_app.date(2026, 8, 28))
         == "http://fake-upstream.local/v1/2026-08-28"
     )
+
+
+def test_openapi_documents_the_real_success_and_error_shapes() -> None:
+    operation = client.get("/openapi.json").json()["paths"]["/tools/convert"]["get"]
+    responses = operation["responses"]
+
+    success_schema = responses["200"]["content"]["application/json"]["schema"]
+    assert success_schema["$ref"].endswith("/ConversionResponse")
+
+    for status_code in ("422", "502", "504"):
+        error_schema = responses[status_code]["content"]["application/json"]["schema"]
+        assert error_schema["$ref"].endswith("/ErrorResponse")

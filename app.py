@@ -13,6 +13,7 @@ import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 
 DEFAULT_UPSTREAM_BASE = "https://api.frankfurter.dev"
@@ -42,6 +43,47 @@ class ConversionError(Exception):
 class RateRecord:
     rate: Decimal
     rate_date: date
+
+
+class ConversionResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_schema_extra={
+            "example": {
+                "amount": 250,
+                "from": "EUR",
+                "to": "TRY",
+                "rate": 47.1234,
+                "result": 11780.85,
+                "rate_date": "2026-08-28",
+                "asked_date": "2026-08-28",
+                "source": "ECB via frankfurter.dev",
+            }
+        },
+    )
+
+    amount: int | float
+    from_: str = Field(alias="from")
+    to: str
+    rate: int | float
+    result: int | float
+    rate_date: str
+    asked_date: str
+    source: str
+
+
+class ErrorResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "error": "invalid_amount",
+                "message": "Amount must be greater than zero.",
+            }
+        }
+    )
+
+    error: str
+    message: str
 
 
 # Historical rates do not change. Including every input that selects a rate in
@@ -202,10 +244,12 @@ def _read_rate_payload(
         ) from None
 
     if (
-        actual_date > asked_date
+        actual_date < FIRST_ECB_RATE_DATE
+        or actual_date > asked_date
         or not rate.is_finite()
         or rate <= 0
         or rate > MAX_SAFE_JSON_NUMBER
+        or float(rate) == 0.0
     ):
         raise ConversionError(
             502,
@@ -267,7 +311,15 @@ def _json_number(value: Decimal) -> int | float:
     return float(value)
 
 
-@app.get("/tools/convert")
+@app.get(
+    "/tools/convert",
+    response_model=ConversionResponse,
+    responses={
+        422: {"model": ErrorResponse, "description": "Invalid request"},
+        502: {"model": ErrorResponse, "description": "Upstream failure"},
+        504: {"model": ErrorResponse, "description": "Upstream timeout"},
+    },
+)
 async def convert(
     amount_raw: str = Query(..., alias="amount"),
     source_raw: str = Query(..., alias="from"),
