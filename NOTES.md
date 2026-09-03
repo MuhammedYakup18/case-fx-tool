@@ -7,8 +7,9 @@ because the payload provides the date the rate actually belongs to. The response
 keeps that as `rate_date` and the caller's date as `asked_date`; a future date or
 a date before 1999-01-04 is rejected. I reject same-currency requests instead of
 claiming a synthetic `1.0` rate came from the ECB. Amounts are positive decimals
-with at most two fractional digits. Calculations retain the full upstream rate
-and round only the final result.
+with at most two fractional digits and a maximum of 1,000,000,000. Calculations
+retain the full upstream rate and round only the final result. A value too large
+to preserve cents as a JSON number is rejected instead of being silently changed.
 
 Expected upstream and input failures return a stable non-2xx error envelope.
 The cache key is `(source, target, asked_date)`, which satisfies repeat requests
@@ -33,8 +34,9 @@ small.
 
 ## One thing the AI got wrong
 
-The initial API research followed Frankfurter's current v2 documentation. The
-template's existing client and expected ECB response shape use v1, whose routes
-and payload differ. I noticed the mismatch while checking the starter code,
-opened the v1 documentation, verified its historical-date response, and changed
-the implementation to call `/v1/<date>` and read the payload's `date` field.
+The first AI-generated draft used `Decimal` for the calculation but converted
+non-integer values to `float` for JSON without limiting their magnitude. An
+adversarial review found that `100000000000000.01` was returned as
+`100000000000000.02`, while `1e30` caused an unhandled 500. I reproduced both,
+added an explicit amount and safe-result limit, returned a stable 422 error, and
+kept both inputs as regression tests.

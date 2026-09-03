@@ -129,6 +129,54 @@ def test_invalid_amounts_fail_without_calling_upstream(
     request_rate.assert_not_awaited()
 
 
+@pytest.mark.parametrize("amount", ["100000000000000.01", "1e30"])
+def test_oversized_amounts_fail_without_losing_precision_or_raising_500(
+    monkeypatch: pytest.MonkeyPatch, amount: str
+) -> None:
+    request_rate = AsyncMock()
+    monkeypatch.setattr(fx_app, "_request_rate", request_rate)
+
+    response = client.get(
+        "/tools/convert",
+        params={"amount": amount, "from": "EUR", "to": "TRY", "date": "2026-08-28"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "amount_too_large"
+    request_rate.assert_not_awaited()
+
+
+def test_conversion_result_too_large_for_safe_json_number_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fx_app,
+        "_request_rate",
+        AsyncMock(
+            return_value=upstream_response(
+                json={
+                    "base": "EUR",
+                    "date": "2026-08-28",
+                    "rates": {"TRY": 70000.01},
+                }
+            )
+        ),
+    )
+
+    response = client.get(
+        "/tools/convert",
+        params={
+            "amount": "1000000000",
+            "from": "EUR",
+            "to": "TRY",
+            "date": "2026-08-28",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "amount_too_large"
+
+
 def test_missing_amount_uses_error_envelope() -> None:
     response = client.get(
         "/tools/convert",

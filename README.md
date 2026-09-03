@@ -51,6 +51,7 @@ out-of-range dates, upstream failures, malformed JSON, and timeouts.
 | Same source and target | Return `422 same_currency` rather than attributing a synthetic `1.0` rate to the ECB. |
 | Missing, non-numeric, zero, or negative amount | Return a `422` error. |
 | More than two amount decimal places | Return `422 invalid_amount_precision`; the tool treats the input as a monetary amount. |
+| Amount above 1,000,000,000, or a converted result too large to represent safely as a JSON number | Return `422 amount_too_large` instead of rounding or crashing. |
 | Slow, unreachable, 5xx, or malformed upstream | Return a `502`/`504` error and no conversion. |
 
 Currency codes are trimmed and normalised to uppercase. Calculations use
@@ -74,6 +75,7 @@ Every failure has a non-2xx status and the same body shape:
 | 422 | `invalid_request` | A required query value is missing or malformed. |
 | 422 | `invalid_amount` | Amount is not finite and greater than zero. |
 | 422 | `invalid_amount_precision` | Amount has more than two decimal places. |
+| 422 | `amount_too_large` | The amount or converted result exceeds the supported numeric range. |
 | 422 | `invalid_currency` | A currency code is not exactly three letters. |
 | 422 | `same_currency` | Source and target are the same. |
 | 422 | `future_date` | The requested date is in the future. |

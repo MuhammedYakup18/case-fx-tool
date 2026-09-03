@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 import httpx
@@ -18,6 +18,11 @@ from fastapi.responses import JSONResponse
 DEFAULT_UPSTREAM_BASE = "https://api.frankfurter.dev"
 FIRST_ECB_RATE_DATE = date(1999, 1, 4)
 UPSTREAM_TIMEOUT_SECONDS = 5.0
+MAX_AMOUNT = Decimal("1000000000")
+# Non-integral Decimal values are emitted as JSON numbers (Python floats).
+# Staying below this magnitude keeps cent-level values distinguishable in an
+# IEEE-754 double. Larger conversions fail instead of silently changing value.
+MAX_SAFE_JSON_NUMBER = Decimal("70000000000000")
 _CURRENCY_CODE = re.compile(r"^[A-Z]{3}$")
 
 app = FastAPI(title="fx-tool", version="1.0.0")
@@ -105,6 +110,12 @@ def _parse_amount(raw_amount: str) -> Decimal:
             "invalid_amount_precision",
             "Amount may have at most two decimal places.",
         )
+    if amount > MAX_AMOUNT:
+        raise ConversionError(
+            422,
+            "amount_too_large",
+            f"Amount must not exceed {MAX_AMOUNT}.",
+        )
     return amount
 
 
@@ -190,13 +201,39 @@ def _read_rate_payload(
             "The exchange-rate provider response did not contain a usable rate.",
         ) from None
 
-    if actual_date > asked_date or not rate.is_finite() or rate <= 0:
+    if (
+        actual_date > asked_date
+        or not rate.is_finite()
+        or rate <= 0
+        or rate > MAX_SAFE_JSON_NUMBER
+    ):
         raise ConversionError(
             502,
             "invalid_upstream_response",
             "The exchange-rate provider returned an invalid rate or date.",
         )
     return RateRecord(rate=rate, rate_date=actual_date)
+
+
+def _calculate_result(amount: Decimal, rate: Decimal) -> Decimal:
+    try:
+        result = (amount * rate).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    except DecimalException:
+        raise ConversionError(
+            502,
+            "invalid_upstream_response",
+            "The exchange-rate provider returned a rate that cannot be used safely.",
+        ) from None
+
+    if result > MAX_SAFE_JSON_NUMBER:
+        raise ConversionError(
+            422,
+            "amount_too_large",
+            "The converted result is too large; use a smaller amount.",
+        )
+    return result
 
 
 async def _get_rate(source: str, target: str, asked_date: date) -> RateRecord:
@@ -251,9 +288,7 @@ async def convert(
     _validate_date(asked_date)
 
     record = await _get_rate(source, target, asked_date)
-    result = (amount * record.rate).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
+    result = _calculate_result(amount, record.rate)
     return {
         "amount": _json_number(amount),
         "from": source,
